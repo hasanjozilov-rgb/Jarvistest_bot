@@ -1,18 +1,16 @@
 services:
-  - type: web
+  - type: worker  # ⬅️ O'ZGARTIRILDI: web -> worker
     name: jarvis-bot
     env: python
     plan: free
-
+    
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python jarvistest/jarvistest/app.py"
     autoDeploy: true
-
-    healthCheckPath: /health
-    healthCheckInterval: 10
-    healthCheckTimeout: 5
-    healthCheckMaxRetries: 3
-
+    
+    # Worker uchun health check kerak emas, lekin sozlasangiz bo'ladi
+    # healthCheckPath: /health  # ⬅️ COMMENT qiling yoki o'chiring
+    
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -23,7 +21,7 @@ services:
       - key: DB_PATH
         value: /data/data.db
         sync: false
-
+    
     disk:
       name: jarvis-data
       mountPath: /data
