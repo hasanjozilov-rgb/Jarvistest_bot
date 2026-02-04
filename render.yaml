@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: jarvis-bot
+    env: python
+    plan: free   # yoki "starter", "standard" — resurs ehtiyojiga qarab
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"
+    autoDeploy: true
+
+    # Health check endpoint
+    healthCheckPath: /health
+    healthCheckTimeout: 5
+    healthCheckInterval: 10
+    healthCheckMaxRetries: 3
+
+    # Muhit o‘zgaruvchilari
+    envVars:
+      - key: BOT_TOKEN
+        sync: false   # Render Dashboard’da qo‘lda qo‘shiladi
+      - key: DATABASE_URL
+        sync: false   # Agar DB ishlatilsa, qo‘lda qo‘shiladi
+
+    # Loglar va monitoring
+    disk:
+      name: jarvis-data
+      mountPath: /data
+      sizeGB: 1
+
+    # Auto-restart va nosog‘lom instance boshqaruvi
+    healthCheck:
+      path: /health
+      intervalSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+      successThreshold: 1
