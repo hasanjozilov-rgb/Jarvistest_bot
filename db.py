@@ -1,579 +1,430 @@
-import sqlite3
+# GitHub Copilot Chat Assistant
 import os
 from datetime import datetime
+from typing import List, Tuple, Optional
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
+from sqlalchemy import (
+    create_engine, MetaData, Table, Column, Integer, String, Text, DateTime,
+    ForeignKey, func, select, insert, update, delete, and_, text
+)
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import NoSuchTableError
+
+# Read DATABASE_URL from environment (Render provides this)
+DB_URL = os.environ.get("DATABASE_URL")
+
+# Fallback to local sqlite file if DATABASE_URL is not set
+if DB_URL:
+    engine: Engine = create_engine(DB_URL, future=True)
+else:
+    sqlite_path = os.path.join(os.path.dirname(__file__), "data.db")
+    engine = create_engine(f"sqlite:///{sqlite_path}", future=True, connect_args={"check_same_thread": False})
+
+metadata = MetaData()
+
+# Table definitions (compatible with both SQLite and Postgres)
+users = Table(
+    "users", metadata,
+    Column("user_id", Integer, primary_key=True),
+    Column("username", String),
+    Column("first_name", String),
+    Column("joined_at", String),  # store ISO timestamp
+    Column("is_blocked", Integer, default=0)
+)
+
+categories = Table(
+    "categories", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String, unique=True)
+)
+
+books = Table(
+    "books", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("title", String),
+    Column("author", String),
+    Column("category_id", Integer, ForeignKey("categories.id", ondelete="SET NULL")),
+    Column("type", String),
+    Column("total_size", Integer, default=0),
+    Column("duration_seconds", Integer, default=0),
+    Column("created_at", String),  # ISO timestamp
+    Column("downloads", Integer, default=0),
+    Column("purchase_link", String, nullable=True)
+)
+
+book_parts = Table(
+    "book_parts", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("book_id", Integer, ForeignKey("books.id", ondelete="CASCADE")),
+    Column("file_id", String),
+    Column("part_index", Integer),
+    Column("size", Integer, default=0),
+    Column("duration_seconds", Integer, default=0)
+)
+
+missing_queries = Table(
+    "missing_queries", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer),
+    Column("query", Text),
+    Column("created_at", String)
+)
+
+user_uploads = Table(
+    "user_uploads", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer),
+    Column("type", String),
+    Column("file_id", String),
+    Column("size", Integer, default=0),
+    Column("duration_seconds", Integer, default=0),
+    Column("created_at", String),
+    Column("is_seen", Integer, default=0)
+)
+
+saved_books = Table(
+    "saved_books", metadata,
+    Column("user_id", Integer, primary_key=True),
+    Column("book_id", Integer, primary_key=True),
+    Column("created_at", String),
+)
+
+wishes = Table(
+    "wishes", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer),
+    Column("text", Text),
+    Column("created_at", String),
+    Column("is_seen", Integer, default=0)
+)
 
 def connect():
-    return sqlite3.connect(DB_PATH)
+    """Return a new connection (SQLAlchemy Connection)."""
+    return engine.connect()
 
 def init_db():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("PRAGMA foreign_keys = ON")
-    try:
-        cur.execute("PRAGMA journal_mode = WAL")
-        cur.execute("PRAGMA synchronous = NORMAL")
-    except:
-        pass
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        joined_at TEXT,
-        is_blocked INTEGER DEFAULT 0
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS categories(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS books(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT,
-        author TEXT,
-        category_id INTEGER,
-        type TEXT,
-        total_size INTEGER DEFAULT 0,
-        duration_seconds INTEGER DEFAULT 0,
-        created_at TEXT,
-        downloads INTEGER DEFAULT 0,
-        FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE SET NULL
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS book_parts(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        book_id INTEGER,
-        file_id TEXT,
-        part_index INTEGER,
-        size INTEGER DEFAULT 0,
-        duration_seconds INTEGER DEFAULT 0,
-        FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
-    )""")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_book_parts_book ON book_parts(book_id, part_index)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_books_cat ON books(category_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_books_created ON books(created_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_books_type ON books(type)")
-    # FTS5 full-text search for fast queries
-    try:
-        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS books_fts USING fts5(title, author, content='books', content_rowid='id')")
-        # triggers to keep FTS in sync
-        cur.execute("""
-        CREATE TRIGGER IF NOT EXISTS books_ai AFTER INSERT ON books BEGIN
-            INSERT INTO books_fts(rowid, title, author) VALUES (new.id, new.title, new.author);
-        END;""")
-        cur.execute("""
-        CREATE TRIGGER IF NOT EXISTS books_au AFTER UPDATE OF title, author ON books BEGIN
-            INSERT INTO books_fts(rowid, title, author) VALUES (new.id, new.title, new.author);
-        END;""")
-        cur.execute("""
-        CREATE TRIGGER IF NOT EXISTS books_ad AFTER DELETE ON books BEGIN
-            DELETE FROM books_fts WHERE rowid = old.id;
-        END;""")
-        # backfill existing rows
-        cur.execute("""
-        INSERT INTO books_fts(rowid, title, author)
-        SELECT id, title, author FROM books
-        WHERE NOT EXISTS (SELECT 1 FROM books_fts f WHERE f.rowid = books.id)
-        """)
-    except:
-        pass
+    """Create tables if they do not exist."""
+    metadata.create_all(engine)
 
-    # Add purchase_link column if missing
-    try:
-        cur.execute("ALTER TABLE books ADD COLUMN purchase_link TEXT")
-    except:
-        pass
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS missing_queries(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        query TEXT,
-        created_at TEXT
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS user_uploads(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        type TEXT,
-        file_id TEXT,
-        size INTEGER DEFAULT 0,
-        duration_seconds INTEGER DEFAULT 0,
-        created_at TEXT,
-        is_seen INTEGER DEFAULT 0
-    )""")
-    conn.commit()
-    conn.close()
-    # Ensure auxiliary tables exist
-    ensure_saved_books_table()
-    ensure_wishes_table()
+# Helper to convert SQLAlchemy Row to tuple like sqlite cursor results
+def _row_to_tuple(row):
+    if row is None:
+        return None
+    return tuple(row)
 
-def upsert_user(user_id, username, first_name):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    exists = cur.fetchone()
-    if exists:
-        cur.execute("UPDATE users SET username=?, first_name=? WHERE user_id=?", (username, first_name, user_id))
-    else:
-        cur.execute("INSERT INTO users(user_id, username, first_name, joined_at) VALUES(?,?,?,?)",
-                    (user_id, username, first_name, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+# ---- CRUD and helper functions ----
 
-def set_block(user_id, blocked):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET is_blocked=? WHERE user_id=?", (1 if blocked else 0, user_id))
-    conn.commit()
-    conn.close()
+def upsert_user(user_id: int, username: Optional[str], first_name: Optional[str]):
+    with engine.begin() as conn:
+        sel = select(users.c.user_id).where(users.c.user_id == user_id)
+        r = conn.execute(sel).fetchone()
+        if r:
+            stmt = update(users).where(users.c.user_id == user_id).values(username=username, first_name=first_name)
+            conn.execute(stmt)
+        else:
+            stmt = insert(users).values(
+                user_id=user_id,
+                username=username,
+                first_name=first_name,
+                joined_at=datetime.utcnow().isoformat()
+            )
+            conn.execute(stmt)
 
-def is_blocked(user_id):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT is_blocked FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return bool(row[0]) if row else False
+def set_block(user_id: int, blocked: bool):
+    with engine.begin() as conn:
+        stmt = update(users).where(users.c.user_id == user_id).values(is_blocked=1 if blocked else 0)
+        conn.execute(stmt)
 
-def get_user_count():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    c = cur.fetchone()[0]
-    conn.close()
-    return c
+def is_blocked(user_id: int) -> bool:
+    with engine.connect() as conn:
+        sel = select(users.c.is_blocked).where(users.c.user_id == user_id)
+        r = conn.execute(sel).fetchone()
+        return bool(r[0]) if r else False
 
-def add_category(name):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO categories(name) VALUES(?)", (name,))
-    conn.commit()
-    conn.close()
+def get_user_count() -> int:
+    with engine.connect() as conn:
+        sel = select(func.count()).select_from(users)
+        return conn.execute(sel).scalar() or 0
 
-def delete_category(cat_id):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM categories WHERE id=?", (cat_id,))
-    conn.commit()
-    conn.close()
+def add_category(name: str):
+    with engine.begin() as conn:
+        # INSERT OR IGNORE semantics
+        if engine.dialect.name == "postgresql":
+            stmt = insert(categories).values(name=name).on_conflict_do_nothing(index_elements=["name"])
+            conn.execute(stmt)
+        else:
+            # sqlite: use simple insert with try/except
+            try:
+                conn.execute(insert(categories).values(name=name))
+            except:
+                pass
 
-def list_categories():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT id, name FROM categories ORDER BY name")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def delete_category(cat_id: int):
+    with engine.begin() as conn:
+        conn.execute(delete(categories).where(categories.c.id == cat_id))
 
-def create_book(title, author, category_id, type_):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO books(title, author, category_id, type, created_at) VALUES(?,?,?,?,?)",
-                (title, author, category_id, type_, datetime.utcnow().isoformat()))
-    book_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return book_id
+def list_categories() -> List[Tuple]:
+    with engine.connect() as conn:
+        sel = select(categories.c.id, categories.c.name).order_by(categories.c.name)
+        rows = conn.execute(sel).fetchall()
+        return [tuple(r) for r in rows]
 
-def update_book_meta(book_id, title=None, author=None, category_id=None):
-    conn = connect()
-    cur = conn.cursor()
-    if title is not None:
-        cur.execute("UPDATE books SET title=? WHERE id=?", (title, book_id))
-    if author is not None:
-        cur.execute("UPDATE books SET author=? WHERE id=?", (author, book_id))
-    if category_id is not None:
-        cur.execute("UPDATE books SET category_id=? WHERE id=?", (category_id, book_id))
-    conn.commit()
-    conn.close()
+def create_book(title: str, author: str, category_id: Optional[int], type_: str) -> int:
+    with engine.begin() as conn:
+        stmt = insert(books).values(
+            title=title,
+            author=author,
+            category_id=category_id,
+            type=type_,
+            created_at=datetime.utcnow().isoformat()
+        )
+        result = conn.execute(stmt)
+        # inserted_primary_key may be available
+        pk = None
+        try:
+            pk = result.inserted_primary_key[0]
+        except:
+            # fallback: fetch last inserted id for sqlite
+            r = conn.execute(select(books.c.id).order_by(books.c.id.desc()).limit(1)).fetchone()
+            pk = r[0] if r else None
+        return int(pk) if pk is not None else None
 
-def delete_book(book_id):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM books WHERE id=?", (book_id,))
-    conn.commit()
-    conn.close()
+def update_book_meta(book_id: int, title: Optional[str]=None, author: Optional[str]=None, category_id: Optional[int]=None):
+    with engine.begin() as conn:
+        values = {}
+        if title is not None:
+            values["title"] = title
+        if author is not None:
+            values["author"] = author
+        if category_id is not None:
+            values["category_id"] = category_id
+        if values:
+            conn.execute(update(books).where(books.c.id == book_id).values(**values))
 
-def add_book_part(book_id, file_id, part_index, size=0, duration_seconds=0):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO book_parts(book_id, file_id, part_index, size, duration_seconds) VALUES(?,?,?,?,?)",
-                (book_id, file_id, part_index, size, duration_seconds))
-    cur.execute("UPDATE books SET total_size = COALESCE(total_size,0) + ?, duration_seconds = COALESCE(duration_seconds,0) + ? WHERE id=?",
-                (size, duration_seconds, book_id))
-    conn.commit()
-    conn.close()
+def delete_book(book_id: int):
+    with engine.begin() as conn:
+        conn.execute(delete(books).where(books.c.id == book_id))
 
-def get_book(book_id):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT id, title, author, category_id, type, total_size, duration_seconds, created_at, downloads, purchase_link FROM books WHERE id=?", (book_id,))
-    b = cur.fetchone()
-    conn.close()
-    return b
+def add_book_part(book_id: int, file_id: str, part_index: int, size: int=0, duration_seconds: int=0):
+    with engine.begin() as conn:
+        conn.execute(insert(book_parts).values(
+            book_id=book_id, file_id=file_id, part_index=part_index, size=size, duration_seconds=duration_seconds
+        ))
+        # update aggregate fields on books
+        conn.execute(update(books).where(books.c.id == book_id).values(
+            total_size=(books.c.total_size + size),
+            duration_seconds=(books.c.duration_seconds + duration_seconds)
+        ))
 
-def list_book_parts(book_id):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT id, file_id, part_index, size, duration_seconds FROM book_parts WHERE book_id=? ORDER BY part_index ASC", (book_id,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def get_book(book_id: int):
+    with engine.connect() as conn:
+        sel = select(
+            books.c.id, books.c.title, books.c.author, books.c.category_id, books.c.type,
+            books.c.total_size, books.c.duration_seconds, books.c.created_at, books.c.downloads, books.c.purchase_link
+        ).where(books.c.id == book_id)
+        r = conn.execute(sel).fetchone()
+        return tuple(r) if r else None
 
-def inc_download(book_id):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE books SET downloads = COALESCE(downloads,0) + 1 WHERE id=?", (book_id,))
-    conn.commit()
-    conn.close()
+def list_book_parts(book_id: int):
+    with engine.connect() as conn:
+        sel = select(book_parts.c.id, book_parts.c.file_id, book_parts.c.part_index, book_parts.c.size, book_parts.c.duration_seconds).where(book_parts.c.book_id == book_id).order_by(book_parts.c.part_index.asc())
+        rows = conn.execute(sel).fetchall()
+        return [tuple(r) for r in rows]
 
-def search_books(query, limit=20):
-    conn = connect()
-    cur = conn.cursor()
-    # Try FTS5 first for better performance and relevancy
-    try:
-        cur.execute("""
-            SELECT b.id, b.title, b.author, b.type, COALESCE(b.downloads,0) AS downloads
-            FROM books_fts f JOIN books b ON b.id = f.rowid
-            WHERE books_fts MATCH ?
-            ORDER BY bm25(f) ASC, b.downloads DESC, b.created_at DESC
-            LIMIT ?
-        """, (query, limit))
-        rows = cur.fetchall()
-        conn.close()
-        return rows
-    except:
-        q = f"%{query.lower()}%"
-        cur.execute("""
-            SELECT id, title, author, type, COALESCE(downloads,0) AS downloads FROM books
-            WHERE lower(title) LIKE ? OR lower(author) LIKE ?
-            ORDER BY downloads DESC, created_at DESC
-            LIMIT ?
-        """, (q, q, limit))
-        rows = cur.fetchall()
-        conn.close()
-        return rows
+def inc_download(book_id: int):
+    with engine.begin() as conn:
+        conn.execute(update(books).where(books.c.id == book_id).values(downloads=(books.c.downloads + 1)))
 
-def books_by_category(cat_id, limit=50):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, title, author, type, COALESCE(downloads,0) AS downloads FROM books
-        WHERE category_id=?
-        ORDER BY created_at DESC
-        LIMIT ?
-    """, (cat_id, limit))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def search_books(query: str, limit: int=20):
+    q = f"%{query}%"
+    with engine.connect() as conn:
+        # Use ILIKE on Postgres; ilike() is supported by SQLAlchemy
+        try:
+            sel = select(books.c.id, books.c.title, books.c.author, books.c.type, books.c.downloads).where(
+                or_(books.c.title.ilike(q), books.c.author.ilike(q))
+            ).order_by(books.c.downloads.desc(), books.c.created_at.desc()).limit(limit)
+        except Exception:
+            # if ilike not available, fallback to lower LIKE
+            sel = select(books.c.id, books.c.title, books.c.author, books.c.type, books.c.downloads).where(
+                or_(func.lower(books.c.title).like(q.lower()), func.lower(books.c.author).like(q.lower()))
+            ).order_by(books.c.downloads.desc(), books.c.created_at.desc()).limit(limit)
+        rows = conn.execute(sel).fetchall()
+        return [tuple(r) for r in rows]
+
+# import or_ used above
+from sqlalchemy import or_
+
+def books_by_category(cat_id: int, limit: int=50):
+    with engine.connect() as conn:
+        sel = select(books.c.id, books.c.title, books.c.author, books.c.type, books.c.downloads).where(books.c.category_id == cat_id).order_by(books.c.created_at.desc()).limit(limit)
+        rows = conn.execute(sel).fetchall()
+        return [tuple(r) for r in rows]
 
 def stats_counts():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM books WHERE type='audio'")
-    audio = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM books WHERE type='pdf'")
-    pdf = cur.fetchone()[0]
-    conn.close()
-    return audio, pdf
+    with engine.connect() as conn:
+        audio = conn.execute(select(func.count()).where(books.c.type == 'audio')).scalar() or 0
+        pdf = conn.execute(select(func.count()).where(books.c.type == 'pdf')).scalar() or 0
+        return int(audio), int(pdf)
 
-def top_books(limit=10):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT id, title, author, type FROM books ORDER BY downloads DESC, created_at DESC LIMIT ?", (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def top_books(limit: int=10):
+    with engine.connect() as conn:
+        sel = select(books.c.id, books.c.title, books.c.author, books.c.type).order_by(books.c.downloads.desc(), books.c.created_at.desc()).limit(limit)
+        rows = conn.execute(sel).fetchall()
+        return [tuple(r) for r in rows]
 
-def recent_books(limit=20):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT id, title, author, type FROM books ORDER BY datetime(created_at) DESC LIMIT ?", (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def recent_books(limit: int=20):
+    with engine.connect() as conn:
+        sel = select(books.c.id, books.c.title, books.c.author, books.c.type).order_by(books.c.created_at.desc()).limit(limit)
+        rows = conn.execute(sel).fetchall()
+        return [tuple(r) for r in rows]
 
-def random_books(limit=10):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT id, title, author, type FROM books ORDER BY RANDOM() LIMIT ?", (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def random_books(limit: int=10):
+    with engine.connect() as conn:
+        if engine.dialect.name == "postgresql":
+            sel = select(books.c.id, books.c.title, books.c.author, books.c.type).order_by(func.random()).limit(limit)
+        else:
+            sel = select(books.c.id, books.c.title, books.c.author, books.c.type).order_by(text("RANDOM()")).limit(limit)
+        rows = conn.execute(sel).fetchall()
+        return [tuple(r) for r in rows]
 
-def save_missing_query(user_id, query):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO missing_queries(user_id, query, created_at) VALUES(?,?,?)",
-                (user_id, query, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+def save_missing_query(user_id: int, query: str):
+    with engine.begin() as conn:
+        conn.execute(insert(missing_queries).values(user_id=user_id, query=query, created_at=datetime.utcnow().isoformat()))
 
-def list_missing_queries_agg(limit=50):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT query, COUNT(*) AS cnt, MAX(created_at) AS last_at
-        FROM missing_queries
-        GROUP BY query
-        ORDER BY cnt DESC, last_at DESC
-        LIMIT ?
-    """, (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def list_missing_queries_agg(limit: int=50):
+    with engine.connect() as conn:
+        stmt = select(missing_queries.c.query, func.count().label("cnt"), func.max(missing_queries.c.created_at).label("last_at")).group_by(missing_queries.c.query).order_by(text("cnt DESC, last_at DESC")).limit(limit)
+        rows = conn.execute(stmt).fetchall()
+        return [tuple(r) for r in rows]
 
 def clear_missing_queries():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM missing_queries")
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(delete(missing_queries))
 
-def save_user_upload(user_id, type_, file_id, size=0, duration_seconds=0):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO user_uploads(user_id, type, file_id, size, duration_seconds, created_at)
-        VALUES(?,?,?,?,?,?)
-    """, (user_id, type_, file_id, size, duration_seconds, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+def save_user_upload(user_id: int, type_: str, file_id: str, size: int=0, duration_seconds: int=0):
+    with engine.begin() as conn:
+        conn.execute(insert(user_uploads).values(user_id=user_id, type=type_, file_id=file_id, size=size, duration_seconds=duration_seconds, created_at=datetime.utcnow().isoformat()))
 
-def list_unseen_uploads(limit=50):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, user_id, type, file_id, size, duration_seconds, created_at
-        FROM user_uploads
-        WHERE COALESCE(is_seen,0)=0
-        ORDER BY datetime(created_at) ASC
-        LIMIT ?
-    """, (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def list_unseen_uploads(limit: int=50):
+    with engine.connect() as conn:
+        sel = select(user_uploads.c.id, user_uploads.c.user_id, user_uploads.c.type, user_uploads.c.file_id, user_uploads.c.size, user_uploads.c.duration_seconds, user_uploads.c.created_at).where(func.coalesce(user_uploads.c.is_seen, 0) == 0).order_by(user_uploads.c.created_at.asc()).limit(limit)
+        rows = conn.execute(sel).fetchall()
+        return [tuple(r) for r in rows]
 
 def mark_all_uploads_seen():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE user_uploads SET is_seen=1 WHERE COALESCE(is_seen,0)=0")
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(update(user_uploads).where(func.coalesce(user_uploads.c.is_seen, 0) == 0).values(is_seen=1))
 
 def file_exists_in_server(file_id: str) -> bool:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM book_parts WHERE file_id=? LIMIT 1", (file_id,))
-    row = cur.fetchone()
-    conn.close()
-    return bool(row)
+    with engine.connect() as conn:
+        sel = select(func.count()).select_from(book_parts).where(book_parts.c.file_id == file_id).limit(1)
+        c = conn.execute(sel).scalar() or 0
+        return bool(c)
 
-# Saved books
 def ensure_saved_books_table():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS saved_books(
-        user_id INTEGER,
-        book_id INTEGER,
-        created_at TEXT,
-        PRIMARY KEY(user_id, book_id),
-        FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
-    )""")
-    conn.commit()
-    conn.close()
+    # tables already created by init_db; keep for API parity
+    init_db()
 
 def add_saved_book(user_id: int, book_id: int):
     ensure_saved_books_table()
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO saved_books(user_id, book_id, created_at) VALUES(?,?,?)",
-                (user_id, book_id, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        try:
+            conn.execute(insert(saved_books).values(user_id=user_id, book_id=book_id, created_at=datetime.utcnow().isoformat()))
+        except:
+            pass
 
-def list_saved_books(user_id: int, offset=0, limit=10):
+def list_saved_books(user_id: int, offset: int=0, limit: int=10):
     ensure_saved_books_table()
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT b.id, b.title, b.author, b.type, COALESCE(b.downloads,0) AS downloads
-        FROM saved_books s JOIN books b ON b.id = s.book_id
-        WHERE s.user_id=?
-        ORDER BY datetime(s.created_at) DESC
-        LIMIT ? OFFSET ?
-    """, (user_id, limit, offset))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    with engine.connect() as conn:
+        sel = select(books.c.id, books.c.title, books.c.author, books.c.type, func.coalesce(books.c.downloads, 0).label("downloads")).select_from(saved_books.join(books, saved_books.c.book_id == books.c.id)).where(saved_books.c.user_id == user_id).order_by(saved_books.c.created_at.desc()).limit(limit).offset(offset)
+        rows = conn.execute(sel).fetchall()
+        return [tuple(r) for r in rows]
 
 def is_book_saved(user_id: int, book_id: int) -> bool:
     ensure_saved_books_table()
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM saved_books WHERE user_id=? AND book_id=? LIMIT 1", (user_id, book_id))
-    row = cur.fetchone()
-    conn.close()
-    return bool(row)
+    with engine.connect() as conn:
+        sel = select(func.count()).select_from(saved_books).where(and_(saved_books.c.user_id == user_id, saved_books.c.book_id == book_id)).limit(1)
+        c = conn.execute(sel).scalar() or 0
+        return bool(c)
 
 def remove_saved_book(user_id: int, book_id: int):
     ensure_saved_books_table()
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM saved_books WHERE user_id=? AND book_id=?", (user_id, book_id))
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(delete(saved_books).where(and_(saved_books.c.user_id == user_id, saved_books.c.book_id == book_id)))
 
 def user_saved_count(user_id: int) -> int:
     ensure_saved_books_table()
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM saved_books WHERE user_id=?", (user_id,))
-    c = cur.fetchone()[0] or 0
-    conn.close()
-    return c
+    with engine.connect() as conn:
+        sel = select(func.count()).select_from(saved_books).where(saved_books.c.user_id == user_id)
+        return int(conn.execute(sel).scalar() or 0)
 
-# Purchase link helpers
 def set_purchase_link(book_id: int, link: str):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE books SET purchase_link=? WHERE id=?", (link, book_id))
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(update(books).where(books.c.id == book_id).values(purchase_link=link))
 
 def clear_purchase_link(book_id: int):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE books SET purchase_link=NULL WHERE id=?", (book_id,))
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(update(books).where(books.c.id == book_id).values(purchase_link=None))
 
-# Counters for statistics
-def saved_books_count():
+def saved_books_count() -> int:
     ensure_saved_books_table()
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM saved_books")
-    c = cur.fetchone()[0]
-    conn.close()
-    return c
+    with engine.connect() as conn:
+        return int(conn.execute(select(func.count()).select_from(saved_books)).scalar() or 0)
 
-def uploads_count():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM user_uploads")
-    c = cur.fetchone()[0]
-    conn.close()
-    return c
+def uploads_count() -> int:
+    with engine.connect() as conn:
+        return int(conn.execute(select(func.count()).select_from(user_uploads)).scalar() or 0)
 
-def missing_queries_count():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM missing_queries")
-    c = cur.fetchone()[0]
-    conn.close()
-    return c
+def missing_queries_count() -> int:
+    with engine.connect() as conn:
+        return int(conn.execute(select(func.count()).select_from(missing_queries)).scalar() or 0)
 
-def total_downloads():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COALESCE(SUM(downloads),0) FROM books")
-    s = cur.fetchone()[0] or 0
-    conn.close()
-    return s
+def total_downloads() -> int:
+    with engine.connect() as conn:
+        s = conn.execute(select(func.coalesce(func.sum(books.c.downloads), 0))).scalar() or 0
+        return int(s)
 
 def ensure_wishes_table():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS wishes(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        text TEXT,
-        created_at TEXT,
-        is_seen INTEGER DEFAULT 0
-    )""")
-    try:
-        cur.execute("ALTER TABLE wishes ADD COLUMN is_seen INTEGER DEFAULT 0")
-    except:
-        pass
-    conn.commit()
-    conn.close()
+    init_db()
 
 def add_wish(user_id: int, text: str):
     ensure_wishes_table()
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO wishes(user_id, text, created_at) VALUES(?,?,?)",
-                (user_id, text, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(insert(wishes).values(user_id=user_id, text=text, created_at=datetime.utcnow().isoformat()))
 
-def wishes_count():
+def wishes_count() -> int:
     ensure_wishes_table()
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM wishes WHERE COALESCE(is_seen,0)=0")
-    c = cur.fetchone()[0]
-    conn.close()
-    return c
+    with engine.connect() as conn:
+        return int(conn.execute(select(func.count()).select_from(wishes).where(func.coalesce(wishes.c.is_seen, 0) == 0)).scalar() or 0)
 
-def list_wishes(offset=0, limit=50, only_unseen=True):
+def list_wishes(offset: int=0, limit: int=50, only_unseen: bool=True):
     ensure_wishes_table()
-    conn = connect()
-    cur = conn.cursor()
-    if only_unseen:
-        cur.execute("""
-            SELECT id, user_id, text, created_at
-            FROM wishes
-            WHERE COALESCE(is_seen,0)=0
-            ORDER BY datetime(created_at) DESC
-            LIMIT ? OFFSET ?
-        """, (limit, offset))
-    else:
-        cur.execute("""
-            SELECT id, user_id, text, created_at
-            FROM wishes
-            ORDER BY datetime(created_at) DESC
-            LIMIT ? OFFSET ?
-        """, (limit, offset))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    with engine.connect() as conn:
+        if only_unseen:
+            sel = select(wishes.c.id, wishes.c.user_id, wishes.c.text, wishes.c.created_at).where(func.coalesce(wishes.c.is_seen,0) == 0).order_by(wishes.c.created_at.desc()).limit(limit).offset(offset)
+        else:
+            sel = select(wishes.c.id, wishes.c.user_id, wishes.c.text, wishes.c.created_at).order_by(wishes.c.created_at.desc()).limit(limit).offset(offset)
+        rows = conn.execute(sel).fetchall()
+        return [tuple(r) for r in rows]
 
 def mark_wish_seen(wish_id: int):
     ensure_wishes_table()
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE wishes SET is_seen=1 WHERE id=?", (wish_id,))
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(update(wishes).where(wishes.c.id == wish_id).values(is_seen=1))
 
-def list_wishes_agg(limit=50, offset=0, only_unseen=True):
+def list_wishes_agg(limit: int=50, offset: int=0, only_unseen: bool=True):
     ensure_wishes_table()
-    conn = connect()
-    cur = conn.cursor()
-    if only_unseen:
-        cur.execute("""
-            SELECT text, COUNT(*) AS cnt
-            FROM wishes
-            WHERE COALESCE(is_seen,0)=0
-            GROUP BY text
-            ORDER BY cnt DESC
-            LIMIT ? OFFSET ?
-        """, (limit, offset))
-    else:
-        cur.execute("""
-            SELECT text, COUNT(*) AS cnt
-            FROM wishes
-            GROUP BY text
-            ORDER BY cnt DESC
-            LIMIT ? OFFSET ?
-        """, (limit, offset))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    with engine.connect() as conn:
+        if only_unseen:
+            stmt = select(wishes.c.text, func.count().label("cnt")).where(func.coalesce(wishes.c.is_seen,0) == 0).group_by(wishes.c.text).order_by(text("cnt DESC")).limit(limit).offset(offset)
+        else:
+            stmt = select(wishes.c.text, func.count().label("cnt")).group_by(wishes.c.text).order_by(text("cnt DESC")).limit(limit).offset(offset)
+        rows = conn.execute(stmt).fetchall()
+        return [tuple(r) for r in rows]
+
+# Initialize DB at import time (optional)
+try:
+    init_db()
+except Exception:
+    # don't crash import if DB not reachable at this moment
+    pass
